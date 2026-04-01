@@ -1,6 +1,31 @@
 # Bluesky Atom feed bot
 
-Scheduled [GitHub Actions](https://docs.github.com/en/actions) workflow that reads the **Atom** feed at [lewisconnolly.com/feed.xml](https://lewisconnolly.com/feed.xml), compares the newest entry to the last one posted, and publishes a short skeet to Bluesky when there is something new.
+Scheduled [GitHub Actions](https://docs.github.com/en/actions) workflow that reads the **Atom** feed at [lewisconnolly.com/feed.xml](https://lewisconnolly.com/feed.xml) and posts **at most one** skeet per run to Bluesky.
+
+## What gets posted
+
+- **Body:** `<summary type="text">` from the entry, or the **title** if there is no summary.
+- **Then:** two newlines and the article URL (`<link rel="alternate">`).
+- **Limit:** the whole post must fit in **300 graphemes** (Bluesky). The URL is always kept intact; the summary is **truncated** at a grapheme boundary (preferring a break at the last space in the second half of the allowed summary span).
+
+Example shape:
+
+```text
+Explore how Jungian shadow work explains our emotional projection onto AI. …
+
+https://lewisconnolly.com/2026/04/01/the-synthetic-shadow/
+```
+
+## Backfill and steady state
+
+- Only entries with **`published` / `updated` ≥ backfill start** are considered. Default start is **`2026-01-18T00:00:00Z`** (UTC), so posting begins with [Condemned to Freedom](https://lewisconnolly.com/2026/01/18/condemned-to-freedom/) and moves forward in time. Override with env **`BACKFILL_MIN_PUBLISHED`** (ISO 8601, e.g. `2026-01-01T00:00:00Z`).
+- Among eligible entries, the bot picks the **oldest** whose `<id>` is **not** already in [`posted-state.json`](posted-state.json) (`postedIds` array). That yields **one new post per hourly run** until the backlog is clear, then **only new feed items** as they appear.
+- If you publish **two** new posts between runs, the **older** of the two is posted first, then the newer on the next run.
+
+## State file
+
+- **[`posted-state.json`](posted-state.json)** holds `{ "postedIds": [ "…", … ] }`. Actions commits it after each successful post.
+- **Legacy:** if `posted-state.json` is missing, the script reads **`last-posted.txt`** (single line = one id) once and migrates to JSON on the next successful write.
 
 ## Prerequisites
 
@@ -39,12 +64,6 @@ npm run label-bot
 
 You can also clarify in the profile bio that posts are automated (e.g. “Essays auto-posted from lewisconnolly.com”).
 
-## First run and `last-posted.txt`
-
-- If **`last-posted.txt` is missing** (or empty), the next successful run will post the **current newest** feed entry—even if you already shared it manually on Bluesky.
-- To avoid that duplicate, **seed** the file before the first workflow run: create `last-posted.txt` with a single line containing that entry’s Atom `<id>` (the permalink URL is usually the same as `id` on your site), commit, and push.
-- After each new post, Actions commits an updated `last-posted.txt` to the repo.
-
 ## Workflow
 
 - **Schedule:** hourly (`cron: "0 * * * *"` UTC). Adjust in [`.github/workflows/post.yml`](.github/workflows/post.yml) if you want a different cadence.
@@ -71,12 +90,16 @@ node post-latest.js
 
 To post for real locally, set `BLUESKY_HANDLE`, `BLUESKY_APP_PASSWORD`, and omit `DRY_RUN`.
 
+Optional:
+
+```powershell
+$env:BACKFILL_MIN_PUBLISHED="2026-01-18T00:00:00Z"
+```
+
 ## Behavior notes
 
 - The feed is **Atom** (`<feed>`, `<entry>`), not RSS 2.0 (`<rss>`, `<item>`).
-- Entries are sorted by **`published` / `updated`**; the newest wins (not raw XML order).
-- Only the **single newest** entry is considered each run. If you publish **two** new posts between runs, **one may be skipped** until you extend the bot to track multiple IDs or timestamps.
-- Post body must stay within Bluesky’s **300 grapheme** limit; very long titles can cause the script to exit with an error until you shorten the template or title.
+- Entries **not** in the live feed anymore are never posted (feed window limitation).
 
 ## References
 

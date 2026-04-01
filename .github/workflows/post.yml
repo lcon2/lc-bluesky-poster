@@ -34,10 +34,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -f last-posted.txt ]; then
-            git add last-posted.txt
+          if [ -f posted-state.json ]; then
+            git add posted-state.json
             if ! git diff --cached --quiet; then
-              git commit -m "Update last posted article"
+              git commit -m "Update posted feed state"
               git push
             fi
           fi
