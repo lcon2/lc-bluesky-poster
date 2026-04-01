@@ -1,0 +1,14 @@
+{
+  "name": "bluesky-atom-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node post-latest.js",
+    "label-bot": "node scripts/label-bot-once.js"
+  },
+  "dependencies": {
+    "@atproto/api": "^0.13.20",
+    "fast-xml-parser": "^4.5.3"
+  }
+}
