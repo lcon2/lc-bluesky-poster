@@ -1,4 +1,4 @@
-import { BskyAgent } from "@atproto/api";
+import { BskyAgent, RichText } from "@atproto/api";
 import { XMLParser } from "fast-xml-parser";
 import fs from "fs/promises";
 
@@ -213,7 +213,14 @@ async function main() {
 
   const agent = new BskyAgent({ service: "https://bsky.social" });
   await agent.login({ identifier: handle, password });
-  await agent.post({ text });
+
+  const rt = new RichText({ text });
+  await rt.detectFacets(agent);
+  const postPayload = { text: rt.text };
+  if (rt.facets?.length) {
+    postPayload.facets = rt.facets;
+  }
+  await agent.post(postPayload);
   postedIds.add(next.id);
   await savePostedIds(postedIds);
   console.log(`Posted: ${next.id}`);

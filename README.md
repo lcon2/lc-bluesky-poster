@@ -16,6 +16,10 @@ Explore how Jungian shadow work explains our emotional projection onto AI. …
 https://lewisconnolly.com/2026/04/01/the-synthetic-shadow/
 ```
 
+The script uses `@atproto/api` **`RichText`** + **`detectFacets`** so the URL is stored as a real **link facet** (clickable in clients). Plain `text` alone is not reliably hyperlinked on Bluesky.
+
+**Link preview cards** (image + title under the post) are a separate **`app.bsky.embed.external`** feature; this bot does not add those unless you extend it to fetch Open Graph metadata and attach an embed.
+
 ## Backfill and steady state
 
 - Only entries with **`published` / `updated` ≥ backfill start** are considered. Default start is **`2026-01-18T00:00:00Z`** (UTC), so posting begins with [Condemned to Freedom](https://lewisconnolly.com/2026/01/18/condemned-to-freedom/) and moves forward in time. Override with env **`BACKFILL_MIN_PUBLISHED`** (ISO 8601, e.g. `2026-01-01T00:00:00Z`).
