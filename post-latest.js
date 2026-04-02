@@ -2,6 +2,7 @@ import { BskyAgent, RichText } from "@atproto/api";
 import * as cheerio from "cheerio";
 import { XMLParser } from "fast-xml-parser";
 import fs from "fs/promises";
+import sharp from "sharp";
 
 const FEED_URL = "https://lewisconnolly.com/feed.xml";
 const FEED_ORIGIN = new URL(FEED_URL);
@@ -15,8 +16,12 @@ const MAX_GRAPHEMES = 300;
 
 const FETCH_TIMEOUT_MS = 15_000;
 const MAX_HTML_BYTES = 2 * 1024 * 1024;
-/** Max bytes to download for og:image before uploadBlob. Site OG images can be multi‑MB PNGs (e.g. screenshots). */
-const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+/** Max bytes to download for og:image (before resize). Site OG images can be multi‑MB PNGs (e.g. screenshots). */
+const MAX_IMAGE_DOWNLOAD_BYTES = 8 * 1024 * 1024;
+/** ATProto / Bluesky hard limit for `embed.external.thumb` (bytes). */
+const BLUESKY_THUMB_MAX_BYTES = 1_000_000;
+/** Target max size after processing so uploads stay under the protocol cap. */
+const THUMB_SAFE_MAX_BYTES = 950_000;
 const MAX_EMBED_TITLE_GRAPHEMES = 300;
 const MAX_EMBED_DESC_GRAPHEMES = 1000;
 
@@ -253,6 +258,42 @@ function parseOpenGraph(html, pageUrl, { titleFallback, descriptionFallback }) {
   };
 }
 
+/**
+ * Produce bytes and MIME for `embed.external.thumb` under Bluesky's 1MB cap, or null if not possible.
+ */
+async function prepareThumbForBluesky(buf, hintMime) {
+  if (!ALLOWED_IMAGE_MIME.has(hintMime)) {
+    return null;
+  }
+  if (buf.length <= THUMB_SAFE_MAX_BYTES) {
+    return { bytes: buf, mime: hintMime };
+  }
+  const maxEdges = [1200, 1000, 800, 600, 480, 400];
+  const qualities = [82, 76, 70, 64, 58, 52, 50];
+  for (const edge of maxEdges) {
+    for (const q of qualities) {
+      try {
+        const out = await sharp(buf, { failOn: "none" })
+          .rotate()
+          .resize({
+            width: edge,
+            height: edge,
+            fit: "inside",
+            withoutEnlargement: true,
+          })
+          .jpeg({ quality: q, mozjpeg: true })
+          .toBuffer();
+        if (out.length <= THUMB_SAFE_MAX_BYTES) {
+          return { bytes: new Uint8Array(out), mime: "image/jpeg" };
+        }
+      } catch {
+        // try next size/quality
+      }
+    }
+  }
+  return null;
+}
+
 async function fetchAndUploadThumb(agent, imageUrl, articleUrl) {
   assertImageUrlAllowed(imageUrl, articleUrl);
   const ctrl = new AbortController();
@@ -271,11 +312,11 @@ async function fetchAndUploadThumb(agent, imageUrl, articleUrl) {
     throw new Error(`Image HTTP ${res.status}`);
   }
   const cl = res.headers.get("content-length");
-  if (cl && Number(cl) > MAX_IMAGE_BYTES) {
+  if (cl && Number(cl) > MAX_IMAGE_DOWNLOAD_BYTES) {
     throw new Error("Image Content-Length too large.");
   }
   const buf = new Uint8Array(await res.arrayBuffer());
-  if (buf.length > MAX_IMAGE_BYTES) {
+  if (buf.length > MAX_IMAGE_DOWNLOAD_BYTES) {
     throw new Error("Image body too large.");
   }
   const ctype = (res.headers.get("content-type") || "")
@@ -285,7 +326,22 @@ async function fetchAndUploadThumb(agent, imageUrl, articleUrl) {
   if (!ALLOWED_IMAGE_MIME.has(ctype)) {
     throw new Error(`Unsupported image type: ${ctype || "(missing)"}`);
   }
-  const upload = await agent.uploadBlob(buf, { encoding: ctype });
+  const prepared = await prepareThumbForBluesky(buf, ctype);
+  if (!prepared) {
+    console.warn(
+      `Could not produce og:image under ${BLUESKY_THUMB_MAX_BYTES} byte Bluesky thumb limit; posting without image.`
+    );
+    return null;
+  }
+  if (prepared.bytes.length > BLUESKY_THUMB_MAX_BYTES) {
+    console.warn(
+      `Prepared thumb still exceeds ${BLUESKY_THUMB_MAX_BYTES} bytes (${prepared.bytes.length}); posting without image.`
+    );
+    return null;
+  }
+  const upload = await agent.uploadBlob(prepared.bytes, {
+    encoding: prepared.mime,
+  });
   return upload.data.blob;
 }
 
