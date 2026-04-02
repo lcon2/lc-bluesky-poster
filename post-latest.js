@@ -15,7 +15,8 @@ const MAX_GRAPHEMES = 300;
 
 const FETCH_TIMEOUT_MS = 15_000;
 const MAX_HTML_BYTES = 2 * 1024 * 1024;
-const MAX_IMAGE_BYTES = 1 * 1024 * 1024;
+/** Max bytes to download for og:image before uploadBlob. Site OG images can be multi‑MB PNGs (e.g. screenshots). */
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const MAX_EMBED_TITLE_GRAPHEMES = 300;
 const MAX_EMBED_DESC_GRAPHEMES = 1000;
 
@@ -130,17 +131,36 @@ function assertArticleUrlAllowed(urlString) {
   }
 }
 
+/** Strip leading www. for apex vs www matching (case-insensitive). */
+function normalizeHostnameWww(hostname) {
+  const h = hostname.toLowerCase();
+  return h.startsWith("www.") ? h.slice(4) : h;
+}
+
+/**
+ * True if imageHost is the same site as referenceHost: exact match after www
+ * normalization, or a subdomain thereof (e.g. cdn.example.com for example.com).
+ */
+function isSameSiteImageHost(imageHost, referenceHost) {
+  const img = normalizeHostnameWww(imageHost);
+  const ref = normalizeHostnameWww(referenceHost);
+  if (img === ref) {
+    return true;
+  }
+  return img.endsWith(`.${ref}`);
+}
+
 function assertImageUrlAllowed(imageUrl, articleUrlString) {
   const article = new URL(articleUrlString);
   const img = new URL(imageUrl, articleUrlString);
   if (img.protocol !== "https:") {
     throw new Error("Only https image URLs are allowed.");
   }
-  const ok =
-    img.hostname === article.hostname || img.hostname === ALLOWED_HOSTNAME;
-  if (!ok) {
+  const okArticle = isSameSiteImageHost(img.hostname, article.hostname);
+  const okFeed = isSameSiteImageHost(img.hostname, ALLOWED_HOSTNAME);
+  if (!okArticle && !okFeed) {
     throw new Error(
-      `Image host ${img.hostname} does not match article or feed host.`
+      `Image host "${img.hostname}" is not same-site as article "${article.hostname}" or feed "${ALLOWED_HOSTNAME}" (www/subdomains allowed).`
     );
   }
 }
@@ -204,6 +224,8 @@ function parseOpenGraph(html, pageUrl, { titleFallback, descriptionFallback }) {
     metaContent($, "twitter:description");
   const imageRaw =
     metaContent($, "og:image") ||
+    metaContent($, "og:image:secure_url") ||
+    metaContent($, "og:image:url") ||
     metaContent($, "twitter:image") ||
     metaContent($, "twitter:image:src");
 
@@ -280,8 +302,15 @@ async function buildExternalEmbed(agent, next) {
     try {
       thumb = await fetchAndUploadThumb(agent, og.imageUrl, next.link);
     } catch (err) {
-      console.warn("Thumbnail skipped:", err.message || err);
+      console.warn(
+        `Thumbnail skipped for ${og.imageUrl}:`,
+        err.message || err
+      );
     }
+  } else {
+    console.log(
+      "No og:image (or og:image:secure_url / og:image:url) in HTML; link card will be text-only."
+    );
   }
 
   return {
@@ -430,6 +459,13 @@ async function main() {
       console.log(
         `[DRY_RUN] Link card: description chars=${og.description.length}, thumb URL=${og.imageUrl ? "yes" : "no"}`
       );
+      if (og.imageUrl) {
+        console.log(`[DRY_RUN] Resolved og:image: ${og.imageUrl}`);
+      } else {
+        console.log(
+          "[DRY_RUN] No og:image (or variants) in HTML; card would be text-only."
+        );
+      }
     } catch (err) {
       console.warn("[DRY_RUN] Link card preview failed:", err.message || err);
     }
