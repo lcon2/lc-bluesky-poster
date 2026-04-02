@@ -1,13 +1,30 @@
 import { BskyAgent, RichText } from "@atproto/api";
+import * as cheerio from "cheerio";
 import { XMLParser } from "fast-xml-parser";
 import fs from "fs/promises";
 
 const FEED_URL = "https://lewisconnolly.com/feed.xml";
+const FEED_ORIGIN = new URL(FEED_URL);
+const ALLOWED_HOSTNAME = FEED_ORIGIN.hostname;
+
 const STATE_FILE = "posted-state.json";
 const LEGACY_STATE_FILE = "last-posted.txt";
 const USER_AGENT = "lewis-bluesky-atom-bot/1.0 (+https://lewisconnolly.com)";
 const DEFAULT_BACKFILL_MIN = "2026-01-18T00:00:00Z";
 const MAX_GRAPHEMES = 300;
+
+const FETCH_TIMEOUT_MS = 15_000;
+const MAX_HTML_BYTES = 2 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 1 * 1024 * 1024;
+const MAX_EMBED_TITLE_GRAPHEMES = 300;
+const MAX_EMBED_DESC_GRAPHEMES = 1000;
+
+const ALLOWED_IMAGE_MIME = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+]);
 
 function backfillMinMs() {
   const raw = process.env.BACKFILL_MIN_PUBLISHED?.trim() || DEFAULT_BACKFILL_MIN;
@@ -71,7 +88,6 @@ function graphemeLength(s) {
   return graphemeSegments(s).length;
 }
 
-/** Truncate to at most max grapheme clusters; prefer breaking at the last space in the second half. */
 function truncateGraphemes(s, max) {
   if (max <= 0) return "";
   const segs = graphemeSegments(s);
@@ -86,6 +102,197 @@ function truncateGraphemes(s, max) {
 
 function normalizeSummaryBody(s) {
   return s.replace(/\s+/g, " ").trim();
+}
+
+function decodeBasicHtmlEntities(s) {
+  return s
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0*39;/g, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">");
+}
+
+function assertArticleUrlAllowed(urlString) {
+  let u;
+  try {
+    u = new URL(urlString);
+  } catch {
+    throw new Error(`Invalid article URL: ${urlString}`);
+  }
+  if (u.protocol !== "https:") {
+    throw new Error("Only https article URLs are allowed.");
+  }
+  if (u.hostname !== ALLOWED_HOSTNAME) {
+    throw new Error(
+      `Article host must be ${ALLOWED_HOSTNAME} (from FEED_URL), got ${u.hostname}`
+    );
+  }
+}
+
+function assertImageUrlAllowed(imageUrl, articleUrlString) {
+  const article = new URL(articleUrlString);
+  const img = new URL(imageUrl, articleUrlString);
+  if (img.protocol !== "https:") {
+    throw new Error("Only https image URLs are allowed.");
+  }
+  const ok =
+    img.hostname === article.hostname || img.hostname === ALLOWED_HOSTNAME;
+  if (!ok) {
+    throw new Error(
+      `Image host ${img.hostname} does not match article or feed host.`
+    );
+  }
+}
+
+async function fetchWithByteLimit(url, maxBytes, acceptHeader) {
+  assertArticleUrlAllowed(url);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      signal: ctrl.signal,
+      headers: {
+        "User-Agent": USER_AGENT,
+        Accept: acceptHeader,
+      },
+      redirect: "follow",
+    });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    }
+    const cl = res.headers.get("content-length");
+    if (cl && Number(cl) > maxBytes) {
+      throw new Error("Response Content-Length exceeds limit.");
+    }
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength > maxBytes) {
+      throw new Error("Response body exceeds byte limit.");
+    }
+    return buf;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchHtmlDocument(articleUrl) {
+  const buf = await fetchWithByteLimit(
+    articleUrl,
+    MAX_HTML_BYTES,
+    "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"
+  );
+  return new TextDecoder("utf-8", { fatal: false }).decode(buf);
+}
+
+function metaContent($, prop) {
+  const el = $(`meta[property="${prop}"]`).first();
+  let v = el.attr("content");
+  if (!v) {
+    v = $(`meta[name="${prop}"]`).first().attr("content");
+  }
+  return v ? decodeBasicHtmlEntities(v.trim()) : "";
+}
+
+function parseOpenGraph(html, pageUrl, { titleFallback, descriptionFallback }) {
+  const $ = cheerio.load(html);
+  let title =
+    metaContent($, "og:title") ||
+    metaContent($, "twitter:title") ||
+    $("title").first().text().trim();
+  let description =
+    metaContent($, "og:description") ||
+    metaContent($, "twitter:description");
+  const imageRaw =
+    metaContent($, "og:image") ||
+    metaContent($, "twitter:image") ||
+    metaContent($, "twitter:image:src");
+
+  if (!title) title = titleFallback;
+  if (!description) description = descriptionFallback;
+
+  title = normalizeSummaryBody(title);
+  description = normalizeSummaryBody(description);
+  if (!title) title = "·";
+  if (!description) description = "·";
+
+  let imageUrl = null;
+  if (imageRaw) {
+    try {
+      imageUrl = new URL(imageRaw, pageUrl).href;
+    } catch {
+      imageUrl = null;
+    }
+  }
+
+  return {
+    title: truncateGraphemes(title, MAX_EMBED_TITLE_GRAPHEMES),
+    description: truncateGraphemes(description, MAX_EMBED_DESC_GRAPHEMES),
+    imageUrl,
+  };
+}
+
+async function fetchAndUploadThumb(agent, imageUrl, articleUrl) {
+  assertImageUrlAllowed(imageUrl, articleUrl);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(imageUrl, {
+      signal: ctrl.signal,
+      headers: { "User-Agent": USER_AGENT },
+      redirect: "follow",
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!res.ok) {
+    throw new Error(`Image HTTP ${res.status}`);
+  }
+  const cl = res.headers.get("content-length");
+  if (cl && Number(cl) > MAX_IMAGE_BYTES) {
+    throw new Error("Image Content-Length too large.");
+  }
+  const buf = new Uint8Array(await res.arrayBuffer());
+  if (buf.length > MAX_IMAGE_BYTES) {
+    throw new Error("Image body too large.");
+  }
+  const ctype = (res.headers.get("content-type") || "")
+    .split(";")[0]
+    .trim()
+    .toLowerCase();
+  if (!ALLOWED_IMAGE_MIME.has(ctype)) {
+    throw new Error(`Unsupported image type: ${ctype || "(missing)"}`);
+  }
+  const upload = await agent.uploadBlob(buf, { encoding: ctype });
+  return upload.data.blob;
+}
+
+async function buildExternalEmbed(agent, next) {
+  assertArticleUrlAllowed(next.link);
+  const html = await fetchHtmlDocument(next.link);
+  const og = parseOpenGraph(html, next.link, {
+    titleFallback: next.title,
+    descriptionFallback: normalizeSummaryBody(next.summary),
+  });
+
+  let thumb;
+  if (og.imageUrl) {
+    try {
+      thumb = await fetchAndUploadThumb(agent, og.imageUrl, next.link);
+    } catch (err) {
+      console.warn("Thumbnail skipped:", err.message || err);
+    }
+  }
+
+  return {
+    $type: "app.bsky.embed.external",
+    external: {
+      uri: next.link,
+      title: og.title,
+      description: og.description,
+      ...(thumb ? { thumb } : {}),
+    },
+  };
 }
 
 function buildPostText(summary, url) {
@@ -184,6 +391,9 @@ function pickNextToPost(eligible, postedIds) {
 async function main() {
   const dryRun =
     process.env.DRY_RUN === "1" || /^true$/i.test(process.env.DRY_RUN ?? "");
+  const dryRunNoFetch =
+    process.env.DRY_RUN_NO_FETCH === "1" ||
+    /^true$/i.test(process.env.DRY_RUN_NO_FETCH ?? "");
 
   const minMs = backfillMinMs();
   const postedIds = await loadPostedIds();
@@ -202,6 +412,27 @@ async function main() {
 
   if (dryRun) {
     console.log("[DRY_RUN] Would post:\n---\n" + text + "\n---");
+    if (dryRunNoFetch) {
+      console.log(
+        "[DRY_RUN] Link card: skipped HTML fetch (DRY_RUN_NO_FETCH=1)."
+      );
+      return;
+    }
+    try {
+      const html = await fetchHtmlDocument(next.link);
+      const og = parseOpenGraph(html, next.link, {
+        titleFallback: next.title,
+        descriptionFallback: normalizeSummaryBody(next.summary),
+      });
+      console.log(
+        `[DRY_RUN] Link card: title=${JSON.stringify(og.title.slice(0, 100))}${og.title.length > 100 ? "…" : ""}`
+      );
+      console.log(
+        `[DRY_RUN] Link card: description chars=${og.description.length}, thumb URL=${og.imageUrl ? "yes" : "no"}`
+      );
+    } catch (err) {
+      console.warn("[DRY_RUN] Link card preview failed:", err.message || err);
+    }
     return;
   }
 
@@ -220,6 +451,9 @@ async function main() {
   if (rt.facets?.length) {
     postPayload.facets = rt.facets;
   }
+
+  postPayload.embed = await buildExternalEmbed(agent, next);
+
   await agent.post(postPayload);
   postedIds.add(next.id);
   await savePostedIds(postedIds);

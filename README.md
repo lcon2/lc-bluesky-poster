@@ -16,9 +16,9 @@ Explore how Jungian shadow work explains our emotional projection onto AI. …
 https://lewisconnolly.com/2026/04/01/the-synthetic-shadow/
 ```
 
-The script uses `@atproto/api` **`RichText`** + **`detectFacets`** so the URL is stored as a real **link facet** (clickable in clients). Plain `text` alone is not reliably hyperlinked on Bluesky.
+The script uses **`RichText`** + **`detectFacets`** so the URL in the body is a real **link facet** (clickable). It also attaches **`app.bsky.embed.external`**: for each post it **GETs the article HTML**, reads Open Graph / Twitter **`meta`** tags (`og:title`, `og:description`, `og:image`, with fallbacks to Atom title/summary), and builds a **link preview card**. If `og:image` resolves to an **https** URL on the **same host as the article or the feed host**, the image is downloaded (≤1MB, jpeg/png/webp/gif) and uploaded via **`com.atproto.repo.uploadBlob`** as the card thumbnail—same pattern as [Website Card Embeds](https://atproto.com/blog/create-post) in the AT Protocol docs.
 
-**Link preview cards** (image + title under the post) are a separate **`app.bsky.embed.external`** feature; this bot does not add those unless you extend it to fetch Open Graph metadata and attach an embed.
+**Network:** each real post does one fetch to the article URL (HTML, ≤2MB, 15s timeout) and optionally one fetch for the preview image. Fetches are restricted to **`https`** and the hostname taken from the configured feed URL (`lewisconnolly.com` in the default script) for articles; images must match the article or feed host (no arbitrary third-party image hosts).
 
 ## Backfill and steady state
 
@@ -92,6 +92,14 @@ $env:DRY_RUN="1"
 node post-latest.js
 ```
 
+By default, **`DRY_RUN=1` still fetches** the article HTML to print a short **link-card preview** (title, description length, whether a thumb URL was found). It does **not** log in or upload blobs. To skip those fetches:
+
+```powershell
+$env:DRY_RUN="1"
+$env:DRY_RUN_NO_FETCH="1"
+node post-latest.js
+```
+
 To post for real locally, set `BLUESKY_HANDLE`, `BLUESKY_APP_PASSWORD`, and omit `DRY_RUN`.
 
 Optional:
@@ -107,6 +115,7 @@ $env:BACKFILL_MIN_PUBLISHED="2026-01-18T00:00:00Z"
 
 ## References
 
+- [Posting via the Bluesky API (embeds)](https://atproto.com/blog/create-post)
 - [Bots | Bluesky](https://docs.bsky.app/docs/starter-templates/bots)
 - [Rate limits | Bluesky](https://docs.bsky.app/docs/advanced-guides/rate-limits)
 - [Bluesky cookbook `ts-bot`](https://github.com/bluesky-social/cookbook/tree/main/ts-bot)
